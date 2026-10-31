@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -28,16 +29,17 @@ def get_engine() -> Engine:
 def _check_school(engine: Engine, school: str | None) -> str | None:
     if school is None:
         return None
-    code = school.upper()
-    if code not in engine.school_codes():
-        raise HTTPException(404, f"Unknown school '{school}'. Known: {sorted(engine.school_codes())}")
-    return code
+    try:
+        return engine.normalize_school(school)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
 
 
 class InterventionIn(BaseModel):
     student_id: str
     category: str = Field(min_length=3, max_length=120)
-    begin_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    # Typed as a date so "2026-13-45" is a 422, not a 500. Defaults to the engine as-of date.
+    begin_date: date | None = None
     parent_involved: bool = True
     notes: str = Field(default="", max_length=1000)
 
@@ -57,9 +59,9 @@ def summary(school: str | None = None, engine: Engine = Depends(get_engine)) -> 
 def students(
     school: str | None = None,
     grade: str | None = Query(default=None, description="K or 1-8"),
-    min_indicators: int = Query(default=0, ge=0, le=4),
+    min_indicators: int = Query(default=0, ge=0, le=5),
     no_intervention: bool | None = None,
-    indicator: str | None = Query(default=None, description="ATT, SUS, CRS or LVL1"),
+    indicator: str | None = Query(default=None, description="ATT, SUS, CRS, LVL1 or DEF"),
     limit: int = Query(default=100, ge=1, le=1000),
     engine: Engine = Depends(get_engine),
 ) -> dict:
@@ -87,6 +89,8 @@ def add_intervention(body: InterventionIn, engine: Engine = Depends(get_engine))
                                        body.parent_involved, body.notes)
     except KeyError as e:
         raise HTTPException(404, "Student not found") from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 @app.get("/brief", response_class=PlainTextResponse)

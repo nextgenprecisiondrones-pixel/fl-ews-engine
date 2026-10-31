@@ -25,6 +25,7 @@ LAST_DAY = date(2026, 10, 30)
 HOLIDAYS = {date(2026, 9, 7)}  # Labor Day
 PM1_DATE = date(2026, 9, 16)
 PRIOR_PM3_DATE = date(2026, 5, 12)
+PRIOR_YEAR_DATES = [date(2026, 3, 3), date(2026, 4, 14), date(2026, 5, 19)]  # 2025-26, must not count
 GRADES_POSTED = date(2026, 10, 23)
 
 GRADE_DESCRIPTORS = [
@@ -55,7 +56,7 @@ SCHEMAS: dict[str, dict[str, str]] = {
     },
     "studentSchoolAssociations": {
         "studentUniqueId": "VARCHAR", "schoolId": "INTEGER", "schoolYear": "INTEGER",
-        "entryDate": "DATE", "entryGradeLevelDescriptor": "VARCHAR",
+        "entryDate": "DATE", "entryGradeLevelDescriptor": "VARCHAR", "exitWithdrawDate": "DATE",
     },
     "calendarDates": {
         "schoolId": "INTEGER", "date": "DATE", "calendarEventDescriptor": "VARCHAR",
@@ -68,6 +69,7 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "disciplineActionIdentifier": "VARCHAR", "studentUniqueId": "VARCHAR",
         "responsibilitySchoolId": "INTEGER", "disciplineDate": "DATE",
         "disciplineDescriptor": "VARCHAR", "incidentIdentifier": "VARCHAR",
+        "actualDisciplineActionLength": "INTEGER",
     },
     "grades": {
         "studentUniqueId": "VARCHAR", "schoolId": "INTEGER", "localCourseCode": "VARCHAR",
@@ -91,6 +93,7 @@ SCHEMAS: dict[str, dict[str, str]] = {
 }
 
 SRD_PROGRAM = "Substantial Reading Deficiency"
+SMD_PROGRAM = "Substantial Mathematics Deficiency"
 
 FIRST_NAMES = [
     "Avery", "Jordan", "Riley", "Camila", "Mateo", "Zoe", "Elijah", "Layla", "Noah", "Maya",
@@ -125,6 +128,9 @@ def instructional_days() -> list[date]:
 def generate(seed: int = 42) -> dict[str, list[dict]]:
     """Build every table in memory. Same seed -> byte-identical output."""
     rng = random.Random(seed)
+    # Second stream for records added after v0.1 (math deficiency, PM1 rows, OSS lengths,
+    # prior-year noise) so the original stream, and the base records, stay stable.
+    extra = random.Random(f"{seed}-v2")
     cal = instructional_days()
     t: dict[str, list[dict]] = {name: [] for name in SCHEMAS}
 
@@ -182,6 +188,16 @@ def generate(seed: int = 42) -> dict[str, list[dict]]:
                     "disciplineDescriptor": rng.choice(
                         ["In-School Suspension", "Out-of-School Suspension"]),
                     "incidentIdentifier": f"INC-{disc_n:05d}",
+                    "actualDisciplineActionLength": extra.randint(1, 3),
+                })
+            if extra.random() < 0.03 + 0.20 * risk:  # last year's suspension: must NOT count
+                disc_n += 1
+                t["disciplineActions"].append({
+                    "disciplineActionIdentifier": f"DA-{disc_n:05d}", "studentUniqueId": stu,
+                    "responsibilitySchoolId": school_id,
+                    "disciplineDate": extra.choice(PRIOR_YEAR_DATES),
+                    "disciplineDescriptor": "Out-of-School Suspension",
+                    "incidentIdentifier": f"INC-{disc_n:05d}", "actualDisciplineActionLength": 2,
                 })
             if rng.random() < 0.10:  # minor actions that must NOT count as suspensions
                 disc_n += 1
@@ -224,12 +240,30 @@ def generate(seed: int = 42) -> dict[str, list[dict]]:
                         "whenAssessedGradeLevelDescriptor": GRADE_DESCRIPTORS[tested_grade],
                         "performanceLevel": lvl,
                     })
+            # Fall PM1 rows carry no achievement level; they must not mask last spring's PM3.
+            if grade >= 3:
+                for subject, ident in [("ELA", "FAST-ELA-READING"), ("Mathematics", "FAST-MATH")]:
+                    if PM1_DATE >= entry:
+                        t["studentAssessments"].append({
+                            "studentUniqueId": stu, "assessmentIdentifier": f"{ident}-PM1",
+                            "academicSubjectDescriptor": subject, "administrationDate": PM1_DATE,
+                            "whenAssessedGradeLevelDescriptor": GRADE_DESCRIPTORS[grade],
+                            "performanceLevel": None,
+                        })
 
             # Substantial reading deficiency (K-3), identified from fall screening
             if grade <= 3 and rng.random() < 0.05 + 0.30 * risk:
                 t["studentProgramAssociations"].append({
                     "studentUniqueId": stu, "programName": SRD_PROGRAM,
                     "beginDate": max(entry, PM1_DATE) + timedelta(days=rng.randint(1, 14)),
+                    "endDate": None,
+                })
+
+            # Substantial mathematics deficiency (K-4), identified from fall screening
+            if grade <= 4 and extra.random() < 0.04 + 0.25 * risk:
+                t["studentProgramAssociations"].append({
+                    "studentUniqueId": stu, "programName": SMD_PROGRAM,
+                    "beginDate": max(entry, PM1_DATE) + timedelta(days=extra.randint(1, 14)),
                     "endDate": None,
                 })
 
@@ -242,6 +276,15 @@ def generate(seed: int = 42) -> dict[str, list[dict]]:
                     "interventionCategory": rng.choice(INTERVENTION_CATEGORIES),
                     "beginDate": rng.choice(cal[20:]), "parentInvolved": rng.random() < 0.8,
                     "notes": "Synthetic record",
+                })
+            if extra.random() < 0.08:  # last year's intervention: does NOT clear this year's 2+
+                int_n += 1
+                t["studentInterventionAssociations"].append({
+                    "interventionIdentificationCode": f"INT-{int_n:05d}",
+                    "studentUniqueId": stu, "schoolId": school_id,
+                    "interventionCategory": extra.choice(INTERVENTION_CATEGORIES),
+                    "beginDate": extra.choice(PRIOR_YEAR_DATES), "parentInvolved": True,
+                    "notes": "Synthetic record (prior school year)",
                 })
     return t
 

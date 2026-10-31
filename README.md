@@ -2,27 +2,55 @@
 
 A working sketch of a **Florida K-8 Early Warning System (EWS) module** as it would sit behind a
 district data platform: Ed-Fi-shaped data in, statute-defined indicators as plain SQL views, a
-small API for school support teams, and an analyst agent that is not allowed to make up numbers.
+small API for school support teams, and an analyst agent instructed to cite tool results for every
+number.
 
 > Concept by Sal Abuawad. Not affiliated with any vendor or school district. All student data is synthetic.
 
 ## Why Florida
 
 Section 1001.42(18)(b), Florida Statutes, requires every school serving K-8 to run an early warning
-system with four specific indicators, and requires a school-based team (with the parent) to decide
-on interventions for any student who shows two or more of them. Schools must also report how many
+system with five specific indicators, and requires a school-based team (with the parent) to decide
+on interventions for any student who shows two or more of them, unless the student is already
+being served by an intervention program at the direction of a school-based multidisciplinary team. Schools must also report how many
 students show each indicator, by grade. The rules are precise enough to express as code and narrow
 enough that every edge case can be tested.
 
 | Code | Indicator | Grades | How this engine evaluates it |
 |------|-----------|--------|------------------------------|
-| ATT  | Attendance below 90% | K-8 | All absences (excused or not) over instructional days enrolled. Integer math, so exactly 90.0% is **not** flagged. Local policy knob: no flag before 10 days enrolled. |
-| SUS  | One or more suspensions | K-8 | In-school or out-of-school suspension. Detentions, conferences etc. do not count. |
-| CRS  | Course failure in ELA or math | 1-8 | Letter grade `F` in an ELA or Mathematics course. Kindergarten never gets CRS. |
-| LVL1 | Level 1 on FAST ELA or math, **or** a substantial reading deficiency | FAST: 3-8, SRD: K-3 | Most recent FAST result per subject. Grade 3 qualifies through either path; both paths still count as one indicator. |
+| ATT  | Attendance below 90% | K-8 | All absences (excused or not) **plus out-of-school suspension days**, over instructional days actually enrolled (transfers counted once). Integer math, so exactly 90.0% is **not** flagged. Local policy knob: no flag before 10 days enrolled. |
+| SUS  | One or more suspensions | K-8 | In-school or out-of-school suspension this school year. Detentions, conferences etc. do not count. |
+| CRS  | Course failure in ELA or math | 1-8 | Letter grade `F` in an ELA or Mathematics course in any grading period this school year. Kindergarten never gets CRS. |
+| LVL1 | Level 1 on the statewide ELA or math assessment | 3-8 | Most recent result per subject **that has a level** (a later PM1 row with no level never hides a Level 1). |
+| DEF  | Substantial reading deficiency, or substantial mathematics deficiency | Reading: K-3, Math: K-4 | Active `studentProgramAssociations` row. A grade-3 student with a Level 1 and a reading deficiency has **two** indicators (LVL1 and DEF). |
 
-Two or more indicators puts a student on the **watchlist**, which also tracks whether any
-intervention is on file and how many days the student has been at 2+.
+Two or more indicators puts a student on the **watchlist**, which also tracks whether a
+current-year intervention is on file and how many days the student has been at 2+.
+
+**School-year scope.** Every indicator counts only records dated on or after `school_year_start`
+(2026-07-01) and on or before `as_of_date`, from enrollments keyed to `school_year` (2027). The one
+deliberate exception is LVL1: in the fall, the statewide level in effect is last spring's PM3, so
+assessments are read back to `assessment_window_start` (2025-07-01, the prior school year).
+
+**Interventions.** Only interventions that began in the current school year (between
+`school_year_start` and `as_of_date`) clear the "no intervention" status. The cutoff is the
+school-year start, not the date the student reached 2+, because the statute's exemption covers a
+student already being served by an intervention program. `POST /interventions` rejects dates
+outside that window (422).
+
+### Statute to SQL
+
+All views are in `ews/rules.sql`; tests are in `tests/`.
+
+| F.S. 1001.42(18)(b) | Code | SQL view / column | Tests |
+|---------------------|------|-------------------|-------|
+| 1.a Attendance below 90%, excused or not, OSS counted | ATT | `enrolled_days`, `oss_days`, `attendance_daily`, `attendance_summary.att_flag` -> `indicator_events` (ATT branch) -> `student_indicators.att` | `test_rules.py::test_att_exactly_90_percent_is_not_flagged`, `test_att_min_days_is_configurable`, `test_oss_days_count_as_absences`, `test_transfer_is_one_student_with_days_enrolled_across_schools` |
+| 1.b One or more suspensions, in school or out | SUS | `suspensions_current` -> `indicator_events` (SUS branch) -> `student_indicators.sus` | `test_sus_counts_iss_and_oss_but_not_other_actions`, `test_prior_year_suspension_and_failure_do_not_count` |
+| 1.c Course failure in ELA or math, any grading period | CRS | `indicator_events` (CRS branch, `grades`) -> `student_indicators.crs` | `test_kindergarten_never_gets_crs`, `test_crs_grade_1_math_failure_flags`, `test_crs_ignores_non_core_subjects_and_d_grades`, `test_prior_year_suspension_and_failure_do_not_count` |
+| 1.d Level 1 on statewide ELA or math | LVL1 | `indicator_events` (LVL1 branch, `studentAssessments`) -> `student_indicators.lvl1` | `test_lvl1_and_def_grade_bounds`, `test_lvl1_uses_most_recent_fast_result`, `test_later_assessment_without_level_does_not_mask_level_1`, `test_assessment_older_than_prior_year_is_ignored` |
+| 1.e Reading deficiency K-3 (s. 1008.25(5)(a)) or math deficiency K-4 (s. 1008.25(6)(a)) | DEF | `indicator_events` (DEF branch, `studentProgramAssociations`) -> `student_indicators.def` | `test_grade_3_level_1_plus_reading_deficiency_is_two_indicators`, `test_math_deficiency_counts_through_grade_4_only`, `test_lvl1_and_def_grade_bounds` |
+| 2. Two or more indicators -> team decision with parent, unless already served by an intervention program | 2+ | `student_indicators.indicator_count`, `grade_counts.two_plus`, `current_interventions`, `watchlist.no_intervention` | `test_two_plus_counting_and_watchlist`, `test_all_five_indicators`, `test_only_current_year_interventions_clear_the_flag`, `test_add_intervention_validates_dates_and_defaults_to_as_of`, `test_api.py::test_post_intervention_rejects_bad_dates` |
+| Scope: current school year, real enrollments | all | `enrollment_spans`, `enrollment` (one row per student, `exitWithdrawDate` honored) | `test_withdrawn_student_and_prior_year_enrollment_are_out_of_scope`, `test_transfer_is_one_student_with_days_enrolled_across_schools` |
 
 ## Architecture
 
@@ -64,7 +92,7 @@ Withlacoochee K-8 Academy (WKA) serves K-8.
 ```bash
 pip install -e ".[dev]"     # or: make install
 make data                   # writes data/*.csv and data/*.parquet (seed 42)
-make test                   # 28 tests
+make test                   # 41 tests
 make run                    # API on http://localhost:8000  (docs at /docs)
 ```
 
@@ -90,8 +118,12 @@ python -m ews.agent "Which students at SHM have 2+ indicators and no interventio
 ```
 
 With `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` set, the agent runs a standard tool-use loop with two
-tools (`find_students`, `get_summary`) that call the engine directly. The system prompt requires
-every figure to come from a tool result and the answer to name the tool calls it used. Without a
+tools (`find_students`, `get_summary`) that call the engine directly. The system prompt instructs
+the model to take every figure from a tool result and name the tool calls it used; there is no
+automated check of the final answer yet (see Production notes). Tools normalize school codes and
+grades case-insensitively and return an explicit error (for example `unknown school code 'XYZ'`)
+instead of a silent zero. Tool results carry student IDs and initials only; full names are never
+sent to the model. Without a
 key it runs an **offline mode**, clearly labeled in its output, that answers a few fixed question
 patterns straight from the engine and says so when a question is outside them.
 
@@ -130,8 +162,15 @@ This is a demo. A district deployment would change the following:
 
 - FAST achievement levels come from last spring's PM3 (levels are reported on PM3); a few retained
   3rd graders carry a grade-3 PM3. Real feeds would also need to handle alternate assessments.
-- Substantial reading deficiency is modeled as a `studentProgramAssociations` row, which is one of
-  several ways a district might record it in Ed-Fi.
+- Substantial reading and mathematics deficiencies are modeled as `studentProgramAssociations` rows,
+  which is one of several ways a district might record them in Ed-Fi.
+- OSS days come from `disciplineActions.actualDisciplineActionLength` (instructional days starting on
+  the discipline date, default 1). A district whose attendance feed already codes OSS days as
+  absences would get the same result; days are never double-counted.
+- `exitWithdrawDate` is treated as the first day no longer enrolled (exclusive).
+- The statutory exemption is approximated: any intervention begun this school year counts. Ed-Fi
+  `studentInterventionAssociations` has no standard field for "directed by a multidisciplinary
+  team", so the engine cannot tell those apart.
 - Course failure uses a progress grade of `F`; a district would map its own grading scales.
 - The 10-day minimum before ATT can flag is a local policy choice, not part of the statute.
 - Interventions posted through the API live in memory until the process restarts.

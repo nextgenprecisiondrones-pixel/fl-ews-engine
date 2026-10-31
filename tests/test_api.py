@@ -53,12 +53,17 @@ def test_students_filters(client):
 def test_students_bad_params(client):
     assert client.get("/students", params={"grade": "12"}).status_code == 422
     assert client.get("/students", params={"indicator": "GPA"}).status_code == 422
+    assert client.get("/students", params={"min_indicators": 5}).status_code == 200
+    assert client.get("/students", params={"min_indicators": 6}).status_code == 422
+    defs = client.get("/students", params={"indicator": "def", "limit": 1000}).json()
+    assert defs["count"] == client.get("/summary").json()["indicators"]["DEF"] > 0
 
 
 def test_student_detail_and_404(client):
     sid = client.get("/students", params={"min_indicators": 3, "limit": 1}).json()["students"][0]["student_id"]
     s = client.get(f"/students/{sid}").json()
-    assert s["team_decision_required"] is True
+    assert s["team_decision_required"] is (s["interventions"] == [] or not any(
+        "2026-07-01" <= i["begin_date"] <= "2026-10-30" for i in s["interventions"]))
     assert len(s["indicator_detail"]) == s["indicator_count"] >= 3
     assert [m["month"] for m in s["attendance_monthly"]] == ["2026-08", "2026-09", "2026-10"]
     assert client.get("/students/0000000").status_code == 404
@@ -85,3 +90,16 @@ def test_brief_is_deterministic(client):
     assert a.text.startswith("WEEKLY EARLY WARNING BRIEF - Sandhill Middle (SHM)")
     two_plus = client.get("/summary", params={"school": "SHM"}).json()["two_plus"]
     assert f"Students with 2+ indicators: {two_plus} " in a.text
+
+
+def test_post_intervention_rejects_bad_dates(client):
+    sid = client.get("/students", params={"min_indicators": 2, "no_intervention": True,
+                                          "limit": 1}).json()["students"][0]["student_id"]
+    for bad in ("2026-13-45", "not-a-date", "1999-01-01", "2027-01-15"):
+        r = client.post("/interventions", json={"student_id": sid, "category": "Attendance contract",
+                                                "begin_date": bad})
+        assert r.status_code == 422, bad
+    still = client.get("/students", params={"min_indicators": 2, "no_intervention": True, "limit": 1000}).json()
+    assert sid in {s["student_id"] for s in still["students"]}
+    ok = client.post("/interventions", json={"student_id": sid, "category": "Attendance contract"})
+    assert ok.status_code == 201 and ok.json()["begin_date"] == "2026-10-30"

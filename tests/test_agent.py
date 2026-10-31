@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace as NS
 
 from ews import agent
@@ -46,7 +47,7 @@ class FakeClient:
         return NS(stop_reason="end_turn", content=[NS(type="text", text=f"Got: {result['content'][:40]}")])
 
 
-def test_online_loop_executes_tools_and_requires_tool_numbers(engine):
+def test_online_loop_executes_tools_and_prompt_requires_tool_numbers(engine):
     fake = FakeClient()
     out = agent.ask_online("Summary for PRE", engine, client=fake, model="test-model")
     assert out.startswith('Got: {"school": "PRE"')
@@ -56,3 +57,44 @@ def test_online_loop_executes_tools_and_requires_tool_numbers(engine):
     assert "MUST come from a tool result" in first["system"]
     msgs = fake.calls[1]["messages"]  # same list the loop mutated
     assert msgs[2]["role"] == "user" and msgs[2]["content"][0]["tool_use_id"] == "t1"
+
+
+def test_tools_normalize_school_case(engine):
+    lower = agent.run_tool(engine, "find_students", {"school": "shm", "min_indicators": 2, "limit": 1000})
+    upper = agent.run_tool(engine, "find_students", {"school": "SHM", "min_indicators": 2, "limit": 1000})
+    assert lower["count"] == upper["count"] > 0
+    assert agent.run_tool(engine, "get_summary", {"school": " shm "})["school"] == "SHM"
+    k = agent.run_tool(engine, "find_students", {"school": "wka", "grade": "k", "indicator": "att", "limit": 1000})
+    assert "error" not in k and all(s["grade"] == "K" for s in k["students"])
+
+
+def test_tools_return_explicit_error_for_unknown_school(engine):
+    for name in ("find_students", "get_summary"):
+        out = agent.run_tool(engine, name, {"school": "XYZ"})
+        assert "unknown school code" in out["error"] and "count" not in out
+    assert "error" in agent.run_tool(engine, "find_students", {"grade": "12"})
+    assert "error" in agent.run_tool(engine, "find_students", {"indicator": "GPA"})
+
+
+def test_tool_output_has_no_student_names(engine):
+    out = agent.run_tool(engine, "find_students", {"min_indicators": 2, "limit": 1000})
+    names = {r["student_name"] for r in engine.find_students(min_indicators=2, limit=1000)}
+    blob = json.dumps(out)
+    assert out["count"] > 0 and "student_name" not in blob
+    assert not any(n in blob for n in names)
+    assert all(s["initials"] and len(s["initials"]) <= 3 for s in out["students"])
+
+
+def test_online_loop_marks_tool_errors(engine):
+    class ErrClient(FakeClient):
+        def create(self, **kw):
+            self.calls.append(kw)
+            if len(self.calls) == 1:
+                return NS(stop_reason="tool_use", content=[
+                    NS(type="tool_use", id="t1", name="get_summary", input={"school": "nope"})])
+            return NS(stop_reason="end_turn", content=[NS(type="text", text="done")])
+
+    fake = ErrClient()
+    agent.ask_online("Summary for nope", engine, client=fake, model="m")
+    res = fake.calls[1]["messages"][2]["content"][0]
+    assert res["is_error"] is True and "unknown school code" in res["content"]

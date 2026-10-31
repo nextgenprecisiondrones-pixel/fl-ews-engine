@@ -15,13 +15,15 @@ import re
 import sys
 from typing import Any
 
-from ews.engine import INDICATORS, Engine
+from ews.engine import INDICATORS, Engine, parse_grade
 
 SYSTEM_PROMPT = """You are an early-warning analyst for a Florida K-8 school district's student
-support teams. Indicators follow s. 1001.42(18)(b), F.S.: ATT (attendance below 90%),
-SUS (one or more suspensions), CRS (ELA or math course failure, grades 1-8), LVL1
-(Level 1 on FAST ELA or math in grades 3-8, or a substantial reading deficiency in K-3).
-Students with 2 or more indicators need a school-based team decision with the parent.
+support teams. The five indicators follow s. 1001.42(18)(b)1., F.S.: ATT (attendance below
+90%, excused or not, OSS days counted), SUS (one or more suspensions), CRS (ELA or math course
+failure, grades 1-8), LVL1 (Level 1 on the statewide ELA or math assessment, grades 3-8), DEF
+(substantial reading deficiency in K-3 or substantial mathematics deficiency in K-4). All are
+scoped to the current school year. Students with 2 or more indicators need a school-based team
+decision with the parent unless already served by a current-year intervention.
 
 Rules:
 - Every number, count, rate, name, or student ID you state MUST come from a tool result in
@@ -29,7 +31,8 @@ Rules:
   answer, say so plainly.
 - Call a tool before answering any quantitative question.
 - Name the tool call(s) your figures came from at the end of the answer.
-- Refer to students by student ID; avoid full names unless the user asks for them.
+- Refer to students by student ID and initials. Tools never return full names.
+- If a tool returns an "error" field, report the error; do not treat it as a zero.
 - Be brief and actionable."""
 
 TOOLS = [
@@ -42,9 +45,9 @@ TOOLS = [
             "properties": {
                 "school": {"type": "string", "description": "School code: HCE, CBE, PRE, SHM, GPM, WKA"},
                 "grade": {"type": "string", "description": "K or 1-8"},
-                "min_indicators": {"type": "integer", "minimum": 0, "maximum": 4},
+                "min_indicators": {"type": "integer", "minimum": 0, "maximum": 5},
                 "no_intervention": {"type": "boolean",
-                                    "description": "true = only students with no intervention on file"},
+                                    "description": "true = only students with no current-year intervention on file"},
                 "indicator": {"type": "string", "enum": list(INDICATORS)},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
             },
@@ -64,18 +67,39 @@ TOOLS = [
 OFFLINE_LABEL = "[OFFLINE MODE - no ANTHROPIC_API_KEY set; canned answer computed directly by the engine]"
 
 
+def _initials(name: str | None) -> str:
+    return "".join(w[0].upper() for w in (name or "").split() if w)
+
+
+def _minimal(row: dict) -> dict:
+    """Strip full names before anything reaches the model: IDs and initials only."""
+    out = {k: v for k, v in row.items() if k != "student_name"}
+    out["initials"] = _initials(row.get("student_name"))
+    return out
+
+
 def run_tool(engine: Engine, name: str, args: dict) -> dict:
-    if name == "get_summary":
-        return engine.summary(args.get("school"))
-    if name == "find_students":
-        rows = engine.find_students(
-            school=args.get("school"), grade=args.get("grade"),
-            min_indicators=args.get("min_indicators", 0),
-            no_intervention=args.get("no_intervention"), indicator=args.get("indicator"),
-            limit=args.get("limit", 50),
-        )
-        return {"count": len(rows), "students": rows}
-    raise ValueError(f"unknown tool {name}")
+    """Execute one tool call. Bad inputs come back as {"error": ...}, never as a silent zero."""
+    try:
+        school = engine.normalize_school(args.get("school"))
+        if name == "get_summary":
+            return engine.summary(school)
+        if name == "find_students":
+            grade = args.get("grade")
+            grade = str(grade).strip().upper() if grade not in (None, "") else None
+            parse_grade(grade)
+            indicator = args.get("indicator")
+            indicator = str(indicator).strip().upper() if indicator else None
+            rows = engine.find_students(
+                school=school, grade=grade,
+                min_indicators=args.get("min_indicators", 0),
+                no_intervention=args.get("no_intervention"), indicator=indicator,
+                limit=args.get("limit", 50),
+            )
+            return {"count": len(rows), "students": [_minimal(r) for r in rows]}
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"error": f"unknown tool {name}"}
 
 
 # ---- online ----------------------------------------------------------------
@@ -100,8 +124,11 @@ def ask_online(question: str, engine: Engine, client: Any = None, model: str | N
                 continue
             try:
                 out = run_tool(engine, block.name, dict(block.input))
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": json.dumps(out, default=str)})
+                result = {"type": "tool_result", "tool_use_id": block.id,
+                          "content": json.dumps(out, default=str)}
+                if "error" in out:
+                    result["is_error"] = True
+                results.append(result)
             except Exception as e:  # surface tool errors to the model, don't crash
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": f"Error: {e}", "is_error": True})
@@ -152,9 +179,10 @@ def ask_offline(question: str, engine: Engine) -> str:
         s = run_tool(engine, "get_summary", {"school": school})
         i = s["indicators"]
         return (f"{OFFLINE_LABEL}\n{school or 'The district'} as of {s['as_of']}: "
-                f"{s['enrolled']} K-8 students. ATT {i['ATT']}, SUS {i['SUS']}, CRS {i['CRS']}, LVL1 {i['LVL1']}. "
+                f"{s['enrolled']} K-8 students. ATT {i['ATT']}, SUS {i['SUS']}, CRS {i['CRS']}, LVL1 {i['LVL1']}, "
+                f"DEF {i['DEF']}. "
                 f"{s['two_plus']} students have 2+ indicators; {s['two_plus_no_intervention']} of them have "
-                f"no intervention on file.\nSource: get_summary(school={school!r})")
+                f"no current-year intervention on file.\nSource: get_summary(school={school!r})")
 
     return (f"{OFFLINE_LABEL}\nOffline mode answers only these patterns:\n"
             "  - 'How many students at SHM have 2+ indicators?' / 'Summary for HCE'\n"
