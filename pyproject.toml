@@ -1,0 +1,33 @@
+[project]
+name = "fl-ews-engine"
+version = "0.1.0"
+description = "Florida K-8 Early Warning System indicator engine (concept, synthetic data)"
+authors = [{ name = "Sal Abuawad" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "anthropic>=0.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+ews-agent = "ews.agent:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ews"]
+
+[tool.setuptools.package-data]
+ews = ["rules.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
